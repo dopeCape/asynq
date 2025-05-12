@@ -840,13 +840,10 @@ func (srv *Server) AddQueue(qname string, priority, concurrency int) error {
 }
 
 func (srv *Server) publishQueueUpdateEvent(qname string, priority, concurrency int) error {
-	// Create event payload
 	payload := fmt.Sprintf("%s:%d:%d", qname, priority, concurrency)
 
-	// Get Redis client from broker
 	client := srv.broker.(*rdb.RDB).Client()
 
-	// Publish to a dedicated channel for queue updates
 	return client.Publish(context.Background(), "asynq:queue:updates", payload).Err()
 }
 

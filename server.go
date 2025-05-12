@@ -59,6 +59,7 @@ type Server struct {
 	healthchecker *healthchecker
 	janitor       *janitor
 	aggregator    *aggregator
+	queueListener *QueueUpdateListener
 }
 
 type serverState struct {
@@ -262,6 +263,10 @@ type Config struct {
 	//
 	// If set to a zero or not set, NewServer will not limit concurrency of the queue.
 	QueueConcurrency map[string]int
+
+	// ListenForQueueUpdate specifies if the server should listen for queue update events.
+	// if unset, the server will not listen for queue update events.
+	ListenForQueueUpdate bool
 }
 
 // GroupAggregator aggregates a group of tasks into one before the tasks are passed to the Handler.
@@ -434,6 +439,8 @@ const (
 	defaultJanitorInterval = 8 * time.Second
 
 	defaultJanitorBatchSize = 100
+
+	defaultListenPreference = false
 )
 
 // NewServer returns a new Server given a redis connection option
@@ -443,7 +450,14 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 	if !ok {
 		panic(fmt.Sprintf("asynq: unsupported RedisConnOpt type %T", r))
 	}
+
+	listenPreference := cfg.ListenForQueueUpdate
+	if !listenPreference {
+		listenPreference = defaultListenPreference
+	}
+	cfg.ListenForQueueUpdate = listenPreference
 	server := NewServerFromRedisClient(redisClient, cfg)
+	server.queueListener = NewQueueUpdateListener(server.logger, server.broker, server, listenPreference)
 	server.sharedConnection = false
 	return server
 }
@@ -514,7 +528,6 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		loglevel = InfoLevel
 	}
 	logger.SetLevel(toInternalLogLevel(loglevel))
-
 	rdb := rdb.NewRDB(c, rdb.WithQueueConcurrency(cfg.QueueConcurrency))
 	starting := make(chan *workerInfo)
 	finished := make(chan *base.TaskMessage)
@@ -614,6 +627,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		maxSize:         cfg.GroupMaxSize,
 		groupAggregator: cfg.GroupAggregator,
 	})
+
 	return &Server{
 		queues:           queues,
 		strictPriority:   cfg.StrictPriority,
@@ -696,12 +710,13 @@ func (srv *Server) Start(handler Handler) error {
 		return fmt.Errorf("asynq: server cannot run with nil handler")
 	}
 	srv.processor.handler = handler
-
+	srv.queueListener.start(&srv.wg)
 	if err := srv.start(); err != nil {
 		return err
 	}
-	srv.logger.Info("Starting processing")
 
+	srv.logger.Info("Starting processing")
+	srv.queueListener.start(&srv.wg)
 	srv.heartbeater.start(&srv.wg)
 	srv.healthchecker.start(&srv.wg)
 	srv.subscriber.start(&srv.wg)
@@ -759,6 +774,7 @@ func (srv *Server) Shutdown() {
 	srv.aggregator.shutdown()
 	srv.healthchecker.shutdown()
 	srv.heartbeater.shutdown()
+	srv.queueListener.shutdown()
 	srv.wg.Wait()
 
 	if !srv.sharedConnection {
@@ -800,69 +816,64 @@ func (srv *Server) Ping() error {
 	return srv.broker.Ping()
 }
 
-func (srv *Server) AddQueue(qname string, priority, concurrency int) {
+func (srv *Server) AddQueue(qname string, priority, concurrency int) error {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 
 	if _, ok := srv.queues[qname]; ok {
 		srv.logger.Warnf("queue %s already exists, skipping", qname)
-		return
+		return nil
 	}
-
-	srv.state.mu.Lock()
-	state := srv.state.value
-	if state == srvStateNew || state == srvStateClosed {
-		srv.queues[qname] = priority
-		srv.state.mu.Unlock()
-		return
-	}
-	srv.state.mu.Unlock()
-
-	srv.logger.Info("restart server...")
-	srv.forwarder.shutdown()
-	srv.processor.shutdown()
-	srv.recoverer.shutdown()
-	srv.syncer.shutdown()
-	srv.subscriber.shutdown()
-	srv.janitor.shutdown()
-	srv.aggregator.shutdown()
-	srv.healthchecker.shutdown()
-	srv.heartbeater.shutdown()
-	srv.wg.Wait()
 
 	srv.queues[qname] = priority
 
+	srv.broker.SetQueueConcurrency(qname, concurrency)
+
+	srv.updateComponentsWithNewQueue(qname)
+
+	if err := srv.publishQueueUpdateEvent(qname, priority, concurrency); err != nil {
+		srv.logger.Errorf("Failed to publish queue update event: %v", err)
+	}
+
+	srv.logger.Infof("Added new queue: %s with priority %d", qname, priority)
+	return nil
+}
+
+func (srv *Server) publishQueueUpdateEvent(qname string, priority, concurrency int) error {
+	payload := fmt.Sprintf("%s:%d:%d", qname, priority, concurrency)
+
+	client := srv.broker.(*rdb.RDB).Client()
+
+	return client.Publish(context.Background(), "asynq:queue:updates", payload).Err()
+}
+
+func (srv *Server) updateComponentsWithNewQueue(qname string) {
 	qnames := make([]string, 0, len(srv.queues))
 	for q := range srv.queues {
 		qnames = append(qnames, q)
 	}
-	srv.broker.SetQueueConcurrency(qname, concurrency)
+
 	srv.heartbeater.queues = srv.queues
+
 	srv.recoverer.queues = qnames
+
 	srv.forwarder.queues = qnames
+
 	srv.processor.resetState()
-	queues := normalizeQueues(srv.queues)
-	orderedQueues := []string(nil)
-	if srv.strictPriority {
-		orderedQueues = sortByPriority(queues)
-	}
 	srv.processor.queueConfig = srv.queues
-	srv.processor.orderedQueues = orderedQueues
+	queues := normalizeQueues(srv.queues)
+	if srv.strictPriority {
+		srv.processor.orderedQueues = sortByPriority(queues)
+	} else {
+		srv.processor.orderedQueues = nil
+	}
+
 	srv.janitor.queues = qnames
+
 	srv.aggregator.resetState()
 	srv.aggregator.queues = qnames
 
-	srv.heartbeater.start(&srv.wg)
-	srv.healthchecker.start(&srv.wg)
-	srv.subscriber.start(&srv.wg)
-	srv.syncer.start(&srv.wg)
-	srv.recoverer.start(&srv.wg)
-	srv.forwarder.start(&srv.wg)
-	srv.processor.start(&srv.wg)
-	srv.janitor.start(&srv.wg)
-	srv.aggregator.start(&srv.wg)
-
-	srv.logger.Info("server restarted")
+	srv.logger.Infof("Updated all components with new queue: %s", qname)
 }
 
 func (srv *Server) HasQueue(qname string) bool {
@@ -870,8 +881,4 @@ func (srv *Server) HasQueue(qname string) bool {
 	defer srv.mu.RUnlock()
 	_, ok := srv.queues[qname]
 	return ok
-}
-
-func (srv *Server) SetQueueConcurrency(queue string, concurrency int) {
-	srv.broker.SetQueueConcurrency(queue, concurrency)
 }

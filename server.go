@@ -826,9 +826,7 @@ func (srv *Server) AddQueue(qname string, priority, concurrency int) error {
 	}
 
 	srv.queues[qname] = priority
-
 	srv.broker.SetQueueConcurrency(qname, concurrency)
-
 	srv.updateComponentsWithNewQueue(qname)
 
 	if err := srv.publishQueueUpdateEvent(qname, priority, concurrency); err != nil {
@@ -839,12 +837,34 @@ func (srv *Server) AddQueue(qname string, priority, concurrency int) error {
 	return nil
 }
 
+func (srv *Server) UpdateQueueConcurrency(qname string, concurrency int) error {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+
+	if _, ok := srv.queues[qname]; !ok {
+		return fmt.Errorf("queue %s does not exist", qname)
+	}
+
+	srv.broker.SetQueueConcurrency(qname, concurrency)
+
+	if err := srv.publishQueueConcurrencyUpdateEvent(qname, concurrency); err != nil {
+		srv.logger.Errorf("Failed to publish queue concurrency update event: %v", err)
+	}
+
+	srv.logger.Infof("Updated concurrency for queue: %s to %d", qname, concurrency)
+	return nil
+}
+
 func (srv *Server) publishQueueUpdateEvent(qname string, priority, concurrency int) error {
 	payload := fmt.Sprintf("%s:%d:%d", qname, priority, concurrency)
-
 	client := srv.broker.(*rdb.RDB).Client()
-
 	return client.Publish(context.Background(), "asynq:queue:updates", payload).Err()
+}
+
+func (srv *Server) publishQueueConcurrencyUpdateEvent(qname string, concurrency int) error {
+	payload := fmt.Sprintf("%s:concurrency:%d", qname, concurrency)
+	client := srv.broker.(*rdb.RDB).Client()
+	return client.Publish(context.Background(), "asynq:queue:concurrency:updates", payload).Err()
 }
 
 func (srv *Server) updateComponentsWithNewQueue(qname string) {
